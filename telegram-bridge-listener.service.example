@@ -1,0 +1,22 @@
+[Unit]
+Description=Telegram bridge listener (long-poll getUpdates into local inbox queue)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace <KIT_DIR> with the kit's absolute path and <USER> with the
+# user the bridge runs as. The token lives in a chmod-600 env file:
+#   TELEGRAM_BOT_TOKEN=<token from @BotFather>
+#   TGBRIDGE_HOME=<KIT_DIR>          (optional; defaults to the kit root)
+EnvironmentFile=<KIT_DIR>/bridge.env
+ExecStart=/usr/bin/env python3 <KIT_DIR>/telegram_bridge/listener.py
+WorkingDirectory=<KIT_DIR>
+Environment=HOME=/home/<USER>
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,104 @@
+# Telegram Bridge Kit — 可复用的 Telegram Bot 双向桥
+
+一套已经实战验证过的 Telegram 双向对话桥代码，纯 Python 标准库、零依赖。
+任何 Bot 都能用：换上自己的 Bot Token 就能跑。给「AI Agent + Telegram」场景设计：
+用户在 Telegram 发消息，桥秒级唤醒 Agent 处理，Agent 通过桥回文字/图片。
+
+## 架构
+
+```
+Telegram 用户
+   │  消息
+   ▼
+listener.py ──长轮询 getUpdates──► inbox.jsonl（本地队列，一行一条 JSON）
+   │                                    │
+   │ 机主消息入队即发                    │ 每 5 秒轮询 diff
+   ▼                                    ▼
+「思考中」动画占位              hook/telegram-bridge.sh（检查点 diff，有新消息才唤醒）
+   ▲                                    │
+   │ 正式回复前自动删除                  ▼
+send_reply.py ◄─────────────── Agent worker（规则见 hook/worker-prompt.md）
+```
+
+四个部件：
+
+| 部件 | 文件 | 作用 |
+|---|---|---|
+| 监听器 | `telegram_bridge/listener.py` | systemd 常驻，长轮询收消息入队；兼管「思考中」动画 |
+| 发送器 | `telegram_bridge/send_reply.py` | 唯一对外发送通道：文字、图片、删占位、机器人对聊限流 |
+| 公共层 | `telegram_bridge/common.py` | Bot API 调用（JSON / multipart）、路径与配置 |
+| 唤醒钩子 | `hook/telegram-bridge.sh` + `hook/worker-prompt.md` | 5 秒轮询队列，有新消息才唤醒 Agent，并附处理规则 |
+
+## 特性
+
+- **秒级唤醒**：监听器长轮询 + 5 秒钩子轮询本地队列，不依赖任何平台 Webhook。
+- **「思考中」动画**：机主消息一入队就发出占位——Telegram 原生「正在输入…」状态（每 4 秒刷新）+ 消息里月相轮换 🌑🌒🌓🌔🌕🌖🌗🌘（1 秒一帧，按截止时间定速）；正式回复发出前自动删除；不回复的轮次有 `--delete-thinking` 清理；10 分钟 TTL 兜底。
+- **图片直达**：`send_reply.py --photo` 用 multipart 上传，图片直接发到 Telegram。
+- **机器人防死循环**：对机器人会话滚动 60 秒最多 60 条，超限脚本直接拒绝（退出码 3 + `RATE_LIMITED`）。
+- **配对白名单**：初始配对模式不回复任何人，机主确认后才锁定 owner ID；之后只处理机主消息，其他真人不回（与机主事务有关的转达机主），其他机器人仅任务相关才回。
+- **重启不丢消息**：getUpdates offset 持久化；状态文件全部原子写（tmp + replace）。
+
+## 快速开始
+
+```bash
+# 1. 准备 Token（@BotFather 创建 Bot 后拿到）
+cp bridge.env.example bridge.env
+chmod 600 bridge.env        # 把 TELEGRAM_BOT_TOKEN 填进去
+
+# 2. 安装监听服务（会生成配对模式的 allowlist.json）
+./install.sh
+
+# 3. 接上 Agent 侧唤醒（二选一）
+#    a) Muse 事件钩子：用 hook/telegram-bridge.sh 注册一个 5 秒钩子，
+#       worker 指令用 hook/worker-prompt.md（替换 <KIT_DIR>）。
+#    b) 其他运行时：任何「每 5 秒 diff inbox.jsonl 与检查点、有新行就唤醒
+#       Agent 并把 worker-prompt.md 作为指令」的机制都可以。
+
+# 4. 配对：用你的 Telegram 给 Bot 发一句话，Agent 会把你的 ID 报给机主
+#    确认，确认后写入 allowlist.json，桥发确认消息，即完成。
+```
+
+不用 systemd 时也可以直接跑监听器：
+
+```bash
+set -a; source bridge.env; set +a
+python3 telegram_bridge/listener.py
+```
+
+## 配置
+
+环境变量（见 `telegram_bridge/common.py`）：
+
+- `TELEGRAM_BOT_TOKEN`：必填。只放 env / 密钥管理里，禁止入库、禁止打印。
+- `TGBRIDGE_HOME`：可选，状态目录，默认套件根目录。其下有 `inbox.jsonl`、`allowlist.json`、`state/`。
+
+可调参数（都在 `listener.py` / `send_reply.py` 顶部）：
+
+- `THINKING_FRAMES`：占位动画帧，想换风格（表情轮换、进度条、打字机）改这里。
+- `THINKING_INTERVAL`：帧间隔秒数。注意一次编辑往返约 0.9 秒，循环已按截止时间定速，设更小也不会更快。
+- `THINKING_TTL`：占位自动过期秒数。
+- `BOT_LIMIT` / `WINDOW`：机器人对聊限流（默认 60 条 / 60 秒）。
+
+## 从 Muse 部署版移植时的差异
+
+原版跑在 Muse 里，Token 放在 Muse 保险库、由运行时在出口处代换，
+代码全程不接触明文；本套件改成最通用的 **env 变量**方式，其他环境直接能跑。
+其余逻辑（队列格式、动画、限流、配对规则）与实战版逐行对应。
+
+## 踩坑清单（实测）
+
+1. 路径一律从配置/绝对路径推导：systemd 环境下 `$HOME` 可能不是用户家目录，相对路径会把队列写错地方且无报错。
+2. VM/容器被替换会抹掉 `/etc/systemd/system/` 的单元文件；单元模板留在仓库里，恢复时重跑 `install.sh`。
+3. Telegram 没有给 Bot 改头像的 API，机器人头像只能在 BotFather 用 `/setuserpic` 改。
+4. Bot API 不向机器人投递其他机器人的消息，60 条/分钟限流是兜底不是主防线。
+5. 收到 429 立即停手，按 `retry_after` 等待，不循环重试。
+
+## 文件清单
+
+```
+telegram_bridge/   common.py / listener.py / send_reply.py
+hook/              telegram-bridge.sh（Muse 钩子脚本）/ worker-prompt.md
+install.sh         systemd 一键安装
+bridge.env.example / allowlist.example.json
+telegram-bridge-listener.service.example
+```
