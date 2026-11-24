@@ -65,6 +65,18 @@ set -a; source bridge.env; set +a
 python3 telegram_bridge/listener.py
 ```
 
+## 在 Muse 中部署（给另一个 Muse 用）
+
+把仓库链接发给另一个 Muse，再加一句话即可：
+
+> 照这个仓库给我部署一套 Telegram 桥，Bot 我新建，Token 走安全录入：https://github.com/rubotter/telegramuse
+
+对方 Muse 会自己完成：clone 仓库 → 跑 `install.sh` 装监听服务 → 按 `hook/` 里的脚本和 worker 提示词模板新建 5 秒事件钩子 → 走配对流程锁定机主。部署时注意三点：
+
+1. **每套部署必须用自己的新 Bot**：去 @BotFather 新建 Bot、拿新 Token。同一个 Bot 的 `getUpdates` 只能被一个监听器消费，两套桥共用一个 Bot 会互相抢消息，两边都只能收到半截对话。
+2. **Token 走安全录入，不要贴在聊天里**：让 Muse 把 Token 写进 `bridge.env`（chmod 600）或它自己的保险库，不要让 Token 留在对话记录、日志或代码里。
+3. **钩子要在目标 Muse 里新建，不是复制文件**：`hook/` 里是脚本和提示词模板，目标 Muse 需要用它自己的钩子机制注册，并把模板里的 `<KIT_DIR>` 换成它那边的实际安装目录。
+
 ## 配置
 
 环境变量（见 `telegram_bridge/common.py`）：
