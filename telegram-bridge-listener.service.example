@@ -5,6 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# User= is REQUIRED: without it the service runs as root while the
+# agent runs as <USER>, and the agent then cannot write the shared
+# state files (thinking placeholder, rate limits) and replies fail.
+User=<USER>
 # Replace <KIT_DIR> with the kit's absolute path and <USER> with the
 # user the bridge runs as. The token lives in a chmod-600 env file:
 #   TELEGRAM_BOT_TOKEN=<token from @BotFather>

@@ -98,9 +98,18 @@ class SharedState:
     def get_changes(self, since=0):
         return self._req("GET", f"/v1/changes?since={int(since)}")
 
+    @property
+    def _cursor_key(self):
+        # Cursors are stored per (API base, bot identity): two bots
+        # sharing one client install against the same backend must not
+        # share a cursor either, or one bot's ack would skip the other's
+        # sync. The token fingerprint stands in for the bot identity.
+        import hashlib
+
+        fp = hashlib.sha256(self.token.encode()).hexdigest()[:12]
+        return f"{self.api}|{fp}"
+
     def _load_cursors(self):
-        # Cursors are stored per API base: pointing the same client at a
-        # different backend (test vs production) must never reuse a cursor.
         try:
             with open(CURSOR_FILE) as f:
                 data = json.load(f)
@@ -109,7 +118,7 @@ class SharedState:
             return {}
 
     def stored_cursor(self):
-        return int(self._load_cursors().get(self.api, 0))
+        return int(self._load_cursors().get(self._cursor_key, 0))
 
     def poll_changes(self):
         """Fetch changes since the stored cursor WITHOUT committing it.
@@ -124,7 +133,7 @@ class SharedState:
 
     def ack_changes(self, cursor):
         cursors = self._load_cursors()
-        cursors[self.api] = int(cursor)
+        cursors[self._cursor_key] = int(cursor)
         tmp = CURSOR_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump(cursors, f)

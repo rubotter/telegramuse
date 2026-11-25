@@ -19,11 +19,47 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from telegram_bridge.common import (  # noqa: E402
     ALLOWLIST_PATH, INBOX_PATH, STATE_DIR, THINKING_PATH,
-    api_call, load_json, save_json,
+    api_call, load_json, save_json, token_fingerprint,
 )
 
 OFFSET_PATH = STATE_DIR / "offset.json"
 BOT_PATH = STATE_DIR / "bot.json"
+HEARTBEAT_PATH = STATE_DIR / "heartbeat.json"
+STREAK_PATH = STATE_DIR / "bot-streak.json"
+
+
+def last_queued_update_id():
+    """Highest update_id already in the inbox (0 if none).
+
+    If the process dies after appending to the inbox but before saving
+    the getUpdates offset, Telegram redelivers the same updates after
+    restart; comparing against the inbox tail keeps them out twice.
+    """
+    try:
+        with open(INBOX_PATH, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size == 0:
+                return 0
+            f.seek(max(0, size - 65536))
+            tail = f.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.strip().splitlines()):
+            try:
+                return int(json.loads(line).get("update_id", 0))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return 0
+
+
+def reset_bot_streak(chat_id):
+    """A human spoke in this chat: reset the bot-to-bot streak counter
+    (see send_reply.py) so bot exchanges may resume."""
+    state = load_json(STREAK_PATH, {})
+    if state.get(str(chat_id)) not in (None, 0):
+        state[str(chat_id)] = 0
+        save_json(STREAK_PATH, state)
 
 # --- Thinking placeholder style (customise freely) -----------------------
 # Native "typing" chat action + a moon-phase cycle in the message text.
@@ -147,22 +183,84 @@ def animation_loop():
                 current = load_json(THINKING_PATH, {})
                 merged = dict(current)
                 for k in removed:
+                    # Only drop the entry if it is still the very record
+                    # this loop removed. A new placeholder created for
+                    # the same chat in the meantime (different
+                    # message_id) must survive, or it becomes an orphan
+                    # nobody ever deletes.
+                    cur = current.get(k)
+                    if cur is not None and cur.get("message_id") != state.get(k, {}).get("message_id"):
+                        continue
                     merged.pop(k, None)
                 for k, v in state.items():
-                    if k in current:
-                        merged[k] = v
+                    cur = current.get(k)
+                    if cur is None:
+                        continue
+                    # A newer placeholder for the same chat (different
+                    # message_id, created while this cycle was editing
+                    # the old one) owns the chat now; the stale snapshot
+                    # must not overwrite it.
+                    if cur.get("message_id") != v.get("message_id"):
+                        continue
+                    merged[k] = v
                 save_json(THINKING_PATH, merged)
         # Pace by deadline, not fixed sleep: an edit round-trip can take
         # most of the frame budget, so sleep only what is left.
         time.sleep(max(0.05, THINKING_INTERVAL - (time.time() - cycle_start)))
 
 
+CHECKPOINT_PATH = STATE_DIR / "telegram-bridge-checkpoint.json"
+INBOX_ROTATE_LINES = 20000
+
+
+def maybe_rotate_inbox(inbox_lines):
+    """Drop inbox lines the agent hook has already checkpointed.
+
+    The listener is the only writer and this runs on its own thread
+    between appends, so the rewrite cannot race another writer; the
+    hook reads via atomic replace. Keeps the hook's per-poll full scan
+    from growing without bound. Returns the new approximate line count.
+    """
+    if inbox_lines <= INBOX_ROTATE_LINES:
+        return inbox_lines
+    last = 0
+    try:
+        last = int(load_json(CHECKPOINT_PATH, {}).get("last_update_id", 0))
+    except Exception:
+        last = 0
+    if last <= 0:
+        return inbox_lines
+    kept = []
+    try:
+        with open(INBOX_PATH, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    if int(json.loads(line).get("update_id", 0)) > last:
+                        kept.append(line)
+                except Exception:
+                    continue
+    except Exception:
+        return inbox_lines
+    tmp = str(INBOX_PATH) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(kept)
+    os.replace(tmp, INBOX_PATH)
+    return len(kept)
+
+
 def main():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     INBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+    # The cached getMe is only valid for the token it was fetched with;
+    # a changed token (or a different bot) invalidates it, otherwise
+    # the own-message filter would use a stale bot_id.
+    try:
+        fp = token_fingerprint()
+    except Exception:
+        fp = None
     bot = load_json(BOT_PATH, None)
-    if not bot:
+    if not bot or (fp is not None and bot.get("_token_fp") != fp):
         try:
             me = api_call("getMe")
         except Exception as e:
@@ -172,6 +270,7 @@ def main():
             print(f"getMe failed: {me}", flush=True)
             sys.exit(1)
         bot = me["result"]
+        bot["_token_fp"] = fp
         save_json(BOT_PATH, bot)
     bot_id = bot.get("id")
     print(f"listener up: bot @{bot.get('username')} id={bot_id}", flush=True)
@@ -179,8 +278,15 @@ def main():
     threading.Thread(target=animation_loop, daemon=True).start()
 
     offset = load_json(OFFSET_PATH, {"offset": 0}).get("offset", 0)
+    last_queued = last_queued_update_id()
+    try:
+        with open(INBOX_PATH, "rb") as f:
+            inbox_lines = sum(1 for _ in f)
+    except Exception:
+        inbox_lines = 0
 
     while True:
+        inbox_lines = maybe_rotate_inbox(inbox_lines)
         try:
             resp = api_call(
                 "getUpdates",
@@ -196,6 +302,11 @@ def main():
             time.sleep(10)
             continue
 
+        # Heartbeat: proof that polling itself is alive, not just the
+        # process. The watchdog treats a stale heartbeat (>180s) as a
+        # failure even when systemd still reports the service active.
+        save_json(HEARTBEAT_PATH, {"ts": time.time()})
+
         updates = resp.get("result", [])
         if not updates:
             continue
@@ -204,6 +315,8 @@ def main():
         queued = []
         for u in updates:
             offset = max(offset, u["update_id"] + 1)
+            if u["update_id"] <= last_queued:
+                continue  # redelivery after a crash; already in the inbox
             msg = u.get("message")
             if not msg:
                 continue
@@ -211,7 +324,9 @@ def main():
             if frm.get("id") == bot_id:
                 continue  # never queue our own messages
             chat = msg.get("chat") or {}
-            queued.append((frm.get("id"), chat.get("id"), chat.get("type")))
+            queued.append((frm.get("id"), chat.get("id"), chat.get("type"),
+                           bool(frm.get("is_bot"))))
+            last_queued = u["update_id"]
             lines.append(json.dumps({
                 "update_id": u["update_id"],
                 "chat_id": chat.get("id"),
@@ -227,11 +342,13 @@ def main():
                 f.write("\n".join(lines) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
+            inbox_lines += len(lines)
             oid = owner_id()
-            if oid is not None:
-                for from_id, chat_id, chat_type in queued:
-                    if from_id == oid and chat_id is not None:
-                        start_thinking(chat_id, chat_type)
+            for from_id, chat_id, chat_type, from_is_bot in queued:
+                if chat_id is not None and not from_is_bot:
+                    reset_bot_streak(chat_id)
+                if oid is not None and from_id == oid and chat_id is not None:
+                    start_thinking(chat_id, chat_type)
         save_json(OFFSET_PATH, {"offset": offset})
 
 

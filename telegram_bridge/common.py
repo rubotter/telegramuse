@@ -33,11 +33,48 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise RuntimeError("redirect refused")
 
 
+def _env_file_value(key: str) -> str:
+    """Read one KEY=value from <BRIDGE_HOME>/bridge.env, if present.
+
+    The listener gets the token from systemd's EnvironmentFile, but the
+    agent-side sender (send_reply.py) is launched by the agent without
+    that environment. Falling back to the same env file gives both
+    processes one credential path.
+    """
+    try:
+        with open(BRIDGE_HOME / "bridge.env", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == key:
+                    return v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
 def _token() -> str:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+        token = _env_file_value("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN is not set (checked environment and bridge.env)"
+        )
     return token
+
+
+def token_fingerprint() -> str:
+    """Short stable fingerprint of the current token (never the token).
+
+    Used to detect token/bot changes against cached state such as
+    state/bot.json: if the fingerprint differs, the cache is stale.
+    """
+    import hashlib
+
+    return hashlib.sha256(_token().encode()).hexdigest()[:16]
 
 
 def api_url(method: str) -> str:

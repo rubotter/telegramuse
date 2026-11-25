@@ -36,6 +36,17 @@ function changeStmt(env, botId, kind, ref) {
     .bind(botId, kind, ref || null, nowIso());
 }
 
+// Retention: keep only the newest CHANGE_KEEP change-log rows. Pruning
+// rides along inside the write batches (opportunistic, no cron needed);
+// cursors older than the retained window simply get an empty page and
+// clients should then do a full re-sync (GET /v1/bots).
+const CHANGE_KEEP = 5000;
+function pruneStmt(env) {
+  return env.DB.prepare(
+    "DELETE FROM changes WHERE seq <= (SELECT MAX(seq) FROM changes) - ?"
+  ).bind(CHANGE_KEEP);
+}
+
 // Parse a JSON request body safely: invalid JSON and a literal `null`
 // body both become {} instead of throwing on property access later.
 async function jsonBody(request) {
@@ -88,18 +99,21 @@ export default {
       const ts = nowIso();
       // Business write + change-log entry in ONE D1 batch (transactional):
       // either both land or neither does, so peers never miss an update.
+      // Partial updates are safe: omitting display_name/owner keeps the
+      // stored values instead of resetting them (COALESCE on conflict).
       await env.DB.batch([
         env.DB.prepare(
           `INSERT INTO bots (bot_id, display_name, owner, definition, version, updated_at)
-           VALUES (?, ?, ?, ?, 1, ?)
+           VALUES (?, COALESCE(?, ?), ?, ?, 1, ?)
            ON CONFLICT(bot_id) DO UPDATE SET
-             display_name = excluded.display_name,
-             owner = excluded.owner,
+             display_name = COALESCE(excluded.display_name, bots.display_name),
+             owner = COALESCE(excluded.owner, bots.owner),
              definition = excluded.definition,
              version = bots.version + 1,
              updated_at = excluded.updated_at`
-        ).bind(botId, body.display_name || botId, body.owner || null, body.definition, ts),
+        ).bind(botId, body.display_name || null, botId, body.owner || null, body.definition, ts),
         changeStmt(env, botId, "definition", null),
+        pruneStmt(env),
       ]);
       const row = await env.DB.prepare("SELECT version, updated_at FROM bots WHERE bot_id = ?").bind(botId).first();
       return json({ bot_id: botId, ...row });
@@ -128,6 +142,7 @@ export default {
            ON CONFLICT(bot_id, task_key) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`
         ).bind(botId, key, status, ts),
         changeStmt(env, botId, "task", key),
+        pruneStmt(env),
       ]);
       return json({ bot_id: botId, task_key: key, updated_at: ts });
     }

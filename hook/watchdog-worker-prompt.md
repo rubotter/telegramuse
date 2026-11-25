@@ -5,7 +5,7 @@
 
 ---
 
-Telegram 桥的监听服务 telegram-bridge-listener 当前不活跃（虚拟机/容器替换会抹掉它的 systemd 单元文件，桥会因此静默失效）。
+Telegram 桥的监听服务 telegram-bridge-listener 当前不健康：一种是服务不活跃（虚拟机/容器替换会抹掉它的 systemd 单元文件，桥会因此静默失效）；另一种是服务还 active、但监听器的轮询心跳已过期（getUpdates 持续失败，进程活着却收不到消息）。两种情况都用同一个自愈脚本处理（后者会自动重启服务）：
 
 请运行自愈脚本：`bash <KIT_DIR>/telegram_bridge/ensure_listener.sh`
 

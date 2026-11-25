@@ -17,7 +17,11 @@ if [[ ! -f "$KIT_DIR/allowlist.json" ]]; then
   echo "allowlist.json created in pairing mode (owner_id null)."
 fi
 
-sed -e "s|<KIT_DIR>|$KIT_DIR|g" -e "s|<USER>|$USER|g" \
+# Resolve the real desktop user: under sudo, $USER can be root,
+# which would render User=root and recreate the permission mismatch.
+BRIDGE_USER="${SUDO_USER:-$USER}"
+if [[ "$BRIDGE_USER" == "root" ]]; then BRIDGE_USER="$(logname 2>/dev/null || echo "$BRIDGE_USER")"; fi
+sed -e "s|<KIT_DIR>|$KIT_DIR|g" -e "s|<USER>|$BRIDGE_USER|g" \
   "$KIT_DIR/telegram-bridge-listener.service.example" | sudo tee "$UNIT" >/dev/null
 
 sudo systemctl daemon-reload

@@ -15,12 +15,37 @@ UNIT_DST="/etc/systemd/system/telegram-bridge-listener.service"
 SERVICE="telegram-bridge-listener"
 
 if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
+  # Active is not enough: a listener whose getUpdates fails forever is
+  # still "active". The listener stamps state/heartbeat.json on every
+  # successful poll; if it is stale (>180s), restart the service.
+  HB="${TGBRIDGE_HOME:-$KIT_DIR}/state/heartbeat.json"
+  stale="$(python3 - "$HB" <<'PYEOF'
+import json, sys, time
+try:
+    ts = float(json.load(open(sys.argv[1], encoding="utf-8"))["ts"])
+    print("0" if time.time() - ts <= 180 else "1")
+except Exception:
+    print("1")
+PYEOF
+)"
+  if [[ "$stale" == "1" ]]; then
+    sudo systemctl restart "$SERVICE" || { echo "FAILED restart (stale heartbeat)"; exit 1; }
+    sleep 3
+    if systemctl is-active --quiet "$SERVICE"; then
+      echo "REPAIRED (restarted: stale polling heartbeat)"
+      exit 0
+    fi
+    echo "FAILED still inactive after restart"
+    exit 1
+  fi
   echo "OK"
   exit 0
 fi
 
 if [[ ! -f "$UNIT_DST" ]]; then
-  sed -e "s|<KIT_DIR>|$KIT_DIR|g" -e "s|<USER>|${USER:-$(id -un)}|g" \
+  BRIDGE_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+  if [[ "$BRIDGE_USER" == "root" ]]; then BRIDGE_USER="$(logname 2>/dev/null || echo "$BRIDGE_USER")"; fi
+  sed -e "s|<KIT_DIR>|$KIT_DIR|g" -e "s|<USER>|$BRIDGE_USER|g" \
     "$KIT_DIR/telegram-bridge-listener.service.example" \
     | sudo tee "$UNIT_DST" >/dev/null || { echo "FAILED render unit"; exit 1; }
 fi
