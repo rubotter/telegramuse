@@ -39,6 +39,8 @@ send_reply.py ◄─────────────── Agent worker（�
 - **配对白名单**：初始配对模式不回复任何人，机主确认后才锁定 owner ID；之后只处理机主消息，其他真人不回（与机主事务有关的转达机主），其他机器人仅任务相关才回。
 - **重启不丢消息**：getUpdates offset 持久化；状态文件全部原子写（tmp + replace）。
 - **掉线自愈**：虚拟机/容器替换会抹掉 systemd 单元文件、监听服务随之静默死亡（实测一晚多次）。看门狗钩子每 5 秒查一次服务状态，掉线才唤醒 Agent 运行 `ensure_listener.sh`：重装单元 → daemon-reload → enable --now → 验证 active，全程约 10 秒，并向机主汇报。
+- **每 Bot 一份角色定义（SOUL）**：创建 Bot 时（配对后、入群前）在私聊里定好身份、角色、负责的账号与任务（数据口径），后续只能由机主在私聊修改。多 Bot 同群时配一份群名册（每群一份、本地保存、不进仓库），并有「状态对齐」协议：群主触发时各 Bot 上报自己的定义，任何 Bot 定义变化后主动发群同步。模板与细则见 `docs/bot-soul-template.md`、示例见 `BOT_SOUL.example.md`。
+- **高级功能：云端共享状态**：所有 Bot 对接 Cloudflare D1（数据库）+ R2（对象存储）+ Workers（API 网关），定义/任务写库同步、文件走对象存储，每 Bot 一个 Token 且只能写自己的数据；免费额度远超所需。设计见 `docs/shared-state-cloudflare.md`，参考实现在 `cloudflare/`。
 
 ## 快速开始
 
@@ -115,7 +117,13 @@ python3 telegram_bridge/listener.py
 
 ```
 telegram_bridge/   common.py / listener.py / send_reply.py
-hook/              telegram-bridge.sh（Muse 钩子脚本）/ worker-prompt.md
+hook/              telegram-bridge.sh（消息钩子）/ telegram-bridge-watchdog.sh（看门狗）
+                   worker-prompt.md / watchdog-worker-prompt.md
+docs/              bot-soul-template.md（角色定义与名册模板）
+                   shared-state-cloudflare.md（云端共享状态设计）
+cloudflare/        schema.sql / worker.js / wrangler.toml.example
+                   shared_state.py / README.md（云端版参考实现）
+BOT_SOUL.example.md  角色定义示例（实例文件本地保存，不入库）
 install.sh         systemd 一键安装
 bridge.env.example / allowlist.example.json
 telegram-bridge-listener.service.example

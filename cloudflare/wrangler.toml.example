@@ -1,0 +1,16 @@
+# Copy to wrangler.toml and fill in your own IDs.
+# Deploy:  npx wrangler deploy
+# Secrets: npx wrangler secret put ADMIN_TOKEN   (choose a long random value)
+
+name = "bot-shared-state"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "bot-shared"
+database_id = "<your-d1-database-id>"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "bot-shared-files"
