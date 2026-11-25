@@ -27,8 +27,12 @@ CREATE TABLE IF NOT EXISTS changes (
   bot_id     TEXT NOT NULL,
   kind       TEXT NOT NULL,               -- definition | task | file
   ref        TEXT,                        -- task_key or file path
+  op         TEXT,                        -- file: put | delete; others: update
   changed_at TEXT NOT NULL
 );
+-- Existing deployments (table created by an older schema.sql): add the
+-- op column once, by hand — CREATE TABLE IF NOT EXISTS will not do it:
+--   ALTER TABLE changes ADD COLUMN op TEXT;
 CREATE INDEX IF NOT EXISTS idx_changes_seq ON changes (seq);
 
 -- API tokens, stored ONLY as SHA-256 hex hashes. The Worker maps a

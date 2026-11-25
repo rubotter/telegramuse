@@ -35,7 +35,8 @@ send_reply.py ◄─────────────── Agent worker（�
 - **秒级唤醒**：监听器长轮询 + 5 秒钩子轮询本地队列，不依赖任何平台 Webhook。
 - **「思考中」动画**：机主消息一入队就发出占位——Telegram 原生「正在输入…」状态（每 4 秒刷新）+ 消息里月相轮换 🌑🌒🌓🌔🌕🌖🌗🌘（1 秒一帧，按截止时间定速）；正式回复发出前自动删除；不回复的轮次有 `--delete-thinking` 清理；10 分钟 TTL 兜底。**群聊自动降速**（4 秒一帧、typing 8 秒刷新）：群里 Bot 限流约 20 次动作/分钟，1 秒一帧会触发 HTTP 429 并连累正式回复（实测踩过）。
 - **图片直达**：`send_reply.py --photo` 用 multipart 上传，图片直接发到 Telegram。
-- **机器人防死循环**：对机器人会话滚动 60 秒最多 60 条，超限脚本直接拒绝（退出码 3 + `RATE_LIMITED`）。
+- **机器人防死循环（两道护栏）**：对机器人会话滚动 60 秒最多 60 条，超限脚本直接拒绝（退出码 3 + `RATE_LIMITED`）；另有连发硬停：连续 20 条 Bot 对话中间没有任何真人发言时直接拒绝（退出码 4 + `STREAK_LIMITED`，真人发言后自动解除）——前者只限速、后者才保证循环终止。两道都按**实际发出的消息条数**计（长文分片逐条计、部分失败按已发数计），且检查与记账在文件锁内完成，并发发送绕不过去。
+- **发送目标护栏**：发送器只向监听器实际收到过消息的会话发送（`state/known-chats.json`），未知会话默认拒绝（退出码 5 + `UNKNOWN_CHAT`），防止入队消息里的注入内容诱导 worker 向任意会话发消息或贴本机文件；确需首发新会话用 `--force`。
 - **配对白名单**：初始配对模式不回复任何人，机主确认后才锁定 owner ID；之后只处理机主消息，其他真人不回（与机主事务有关的转达机主），其他机器人仅任务相关才回。
 - **重启不丢消息**：getUpdates offset 持久化；状态文件全部原子写（tmp + replace）。
 - **掉线自愈**：虚拟机/容器替换会抹掉 systemd 单元文件、监听服务随之静默死亡（实测一晚多次）。看门狗钩子每 5 秒查一次服务状态，掉线才唤醒 Agent 运行 `ensure_listener.sh`：重装单元 → daemon-reload → enable --now → 验证 active，全程约 10 秒，并向机主汇报。
@@ -44,10 +45,12 @@ send_reply.py ◄─────────────── Agent worker（�
 
 ## 快速开始
 
+前置要求：**Python ≥ 3.10**（代码用了 3.10+ 语法，install.sh 会先检查）；systemd 路径还需要 sudo（写单元文件、管理服务）。
+
 ```bash
 # 1. 准备 Token（@BotFather 创建 Bot 后拿到）
 cp bridge.env.example bridge.env
-chmod 600 bridge.env        # 把 TELEGRAM_BOT_TOKEN 填进去
+chmod 600 bridge.env        # 把 TELEGRAM_BOT_TOKEN 填进去（忘了改权限 install.sh 会自动收紧到 600）
 
 # 2. 安装监听服务（会生成配对模式的 allowlist.json）
 ./install.sh
@@ -62,8 +65,12 @@ chmod 600 bridge.env        # 把 TELEGRAM_BOT_TOKEN 填进去
 #    再注册一个 5 秒钩子，worker 指令用 hook/watchdog-worker-prompt.md。
 #    监听服务被环境替换弄掉线时，它会自动修复并汇报。
 
-# 5. 配对：用你的 Telegram 给 Bot 发一句话，Agent 会把你的 ID 报给机主
-#    确认，确认后写入 allowlist.json，桥发确认消息，即完成。
+# 5. 配对：用你的 Telegram 给 Bot 发一句话，Agent 会在执行总结里把
+#    你的候选 ID（from_id）报给机主。机主在主聊天确认后，由主代理
+#    （或机主本人）把 owner_id / owner_username 写入 allowlist.json
+#    ——监听器每次入队都会重读该文件，改完立即生效、无需重启。
+#    然后你再发一条消息，桥会用 send_reply 回一条配对确认，配对完成。
+#    之后在私聊里完成角色定义（见 docs/bot-soul-template.md 时机一）。
 ```
 
 不用 systemd 时也可以直接跑监听器：
@@ -72,6 +79,12 @@ chmod 600 bridge.env        # 把 TELEGRAM_BOT_TOKEN 填进去
 set -a; source bridge.env; set +a
 python3 telegram_bridge/listener.py
 ```
+
+注意非 systemd 模式的边界：`ensure_listener.sh` 自愈只驱动 systemd，
+无 systemd 时它会明确报 FAILED（no systemd），需人工拉起监听器；
+看门狗钩子在无 systemd 时自动退化为只看轮询心跳判活，唤醒原因会是
+heartbeat_stale，worker 收到后应人工检查/重启监听器进程，而不是
+反复跑自愈脚本。
 
 ## 在 Muse 中部署（给另一个 Muse 用）
 
@@ -90,14 +103,15 @@ python3 telegram_bridge/listener.py
 环境变量（见 `telegram_bridge/common.py`）：
 
 - `TELEGRAM_BOT_TOKEN`：必填。只放 env / 密钥管理里，禁止入库、禁止打印。
-- `TGBRIDGE_HOME`：可选，状态目录，默认套件根目录。其下有 `inbox.jsonl`、`allowlist.json`、`state/`。
+- `TGBRIDGE_HOME`：可选，状态目录，默认套件根目录。其下有 `inbox.jsonl`、`allowlist.json`、`state/`。解析顺序全组件一致：真实环境变量 > 套件根目录 `bridge.env` 里的同名键 > 套件根目录——只写在 bridge.env 里也对所有组件生效，不会把桥劈成两个目录。
 
 可调参数（都在 `listener.py` / `send_reply.py` 顶部）：
 
 - `THINKING_FRAMES`：占位动画帧，想换风格（表情轮换、进度条、打字机）改这里。
 - `THINKING_INTERVAL`：帧间隔秒数。注意一次编辑往返约 0.9 秒，循环已按截止时间定速，设更小也不会更快。
 - `THINKING_TTL`：占位自动过期秒数。
-- `BOT_LIMIT` / `WINDOW`：机器人对聊限流（默认 60 条 / 60 秒）。
+- `BOT_LIMIT` / `WINDOW`：机器人对聊速率护栏（默认 60 条 / 60 秒，按消息条数计）。
+- `STREAK_LIMIT`：机器人连发护栏（默认连续 20 条，真人发言重置）。
 
 ## 从 Muse 部署版移植时的差异
 

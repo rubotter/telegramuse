@@ -37,53 +37,65 @@
 只绑在 Worker 上；每个 Bot 只持自己的 API Token，Worker 按
 Token → bot_id 映射强制权限：
 
-- 只能写**自己**的定义行、自己的任务行、R2 里 `bots/<bot_id>/` 前缀
-- 可以读全部 Bot 的定义/任务、R2 的 `shared/` 公共前缀
-- Token 由群主（Cloudflare 账号主）签发和吊销；泄露只影响该 Bot 自己
+- 只能写**自己**的定义行、自己的任务行、R2 里 `bots/<bot_id>/` 与
+  `shared/` 前缀。
+- **读取是全员可读的**：任何已鉴权 Bot 都能读全部 Bot 的定义、任务，
+  以及 R2 里的**全部文件**，包括别人的 `bots/<bot_id>/` 前缀。
+  `bots/<bot_id>/` 只是**写保护**，不是私密区——不要往云端放任何
+  敏感文件（凭证、私密文档、机主隐私），放了等于发给全群 Bot。
+- Token 由群主（Cloudflare 账号主）签发和吊销。写权限上泄露只
+  影响该 Bot 自己的数据；但免费额度是**全群共享**的：一个泄露或
+  失控的 Token 高频写库、灌任务行，耗的是所有 Bot 共用的 D1 写
+  额度（10 万行/天），能把全群拖停。网关已对单请求设上限（定义
+  ≤256 KB、任务状态 ≤64 KB、任务 key ≤200 字符、列表接口有行数
+  上限并带 truncated 标记）；发现异常仍要第一时间吊销 Token。
 - 注意：`shared/` 是无版本、无作者保护的公共区，任何 Bot 都能覆盖或
   删除其中的文件（网关不做区分）。重要文件请放自己的 `bots/<bot_id>/`
-  前缀，`shared/` 只放可再生的交换件。
-- 变更日志只保留最新 5000 条（写入时顺带清理）；游标落后于保留
-  窗口的 Bot 拉不到增量时，应直接全量重拉（`GET /v1/bots`）。
+  前缀（防别人改，不防别人看），`shared/` 只放可再生的交换件。
+- 变更日志只保留最新 5000 条（所有写路径顺带清理）；变更接口会
+  返回 `oldest_seq` 与 `truncated` 标记：游标落后于保留窗口的 Bot
+  会被明确告知增量已丢失，应直接全量重拉（`GET /v1/bots` +
+  sync-roster），而不是默默 ack 过去。
 
 ## 数据模型（D1）
 
-```sql
-CREATE TABLE bots (
-  bot_id      TEXT PRIMARY KEY,        -- 如 examplebot
-  display_name TEXT NOT NULL,
-  owner       TEXT,
-  definition  TEXT NOT NULL,           -- SOUL 全文（JSON 或 Markdown）
-  version     INTEGER NOT NULL DEFAULT 1,
-  updated_at  TEXT NOT NULL            -- ISO 时间
-);
-CREATE TABLE tasks (
-  bot_id TEXT NOT NULL, task_key TEXT NOT NULL,
-  status TEXT NOT NULL,                -- JSON：进度/状态/备注
-  updated_at TEXT NOT NULL,
-  PRIMARY KEY (bot_id, task_key)
-);
-CREATE TABLE changes (                  -- 变更日志，供增量同步
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  bot_id TEXT NOT NULL, kind TEXT NOT NULL,  -- definition | task | file
-  ref TEXT, changed_at TEXT NOT NULL
-);
-CREATE TABLE api_tokens (               -- Token 只存 SHA-256 哈希
-  token_hash TEXT PRIMARY KEY,
-  bot_id TEXT NOT NULL, created_at TEXT NOT NULL
-);
--- 完整建表以 cloudflare/schema.sql 为准（含索引），部署时直接用它，
--- 不要照抄本页片段。
-```
+四张表：`bots`（定义）、`tasks`（任务状态）、`changes`（变更日志，
+含 `op` 列区分文件 put/delete）、`api_tokens`（Token 只存 SHA-256
+哈希）。**建表只用 `cloudflare/schema.sql`**，部署时直接执行该文件；
+本文不再内嵌 SQL 片段，以免与实现漂移。已部署的旧库升级方式见
+`cloudflare/README.md` 的迁移说明。
 
-## API（Worker 提供，示例）
+## API（Worker 提供）
+
+Bot 接口（Bearer Token 鉴权）：
 
 - `PUT /v1/me/definition` — 更新自己的角色定义（version+1，写变更日志）
+- `GET /v1/me` — 读自己的定义行
 - `PUT /v1/me/tasks/<key>` — 更新自己的任务状态
-- `GET /v1/bots` — 拉全部 Bot 的定义（同步名册用）
-- `GET /v1/changes?since=<seq>` — 增量拉变更，返回新 seq 游标
-- `PUT /v1/files/<path>` / `GET /v1/files/<path>` — R2 文件读写
-  （自己的前缀可写，`shared/` 全员可读、按约定可写）
+- `GET /v1/tasks[?bot=<bot_id>]` — 拉全部（或指定 Bot 的）任务状态，
+  带行数上限与 `truncated` 标记
+- `GET /v1/bots` — 拉全部 Bot 的定义（同步名册用），同样带
+  `truncated` 标记
+- `GET /v1/changes?since=<seq>` — 增量拉变更，返回新 seq 游标、
+  `oldest_seq` 与 `truncated`（游标是否已落后于保留窗口）
+- `PUT /v1/files/<path>` / `GET /v1/files/<path>` /
+  `DELETE /v1/files/<path>` — R2 文件读写删（写删限自己的前缀与
+  `shared/`，读全员可读）；列表用 `GET /v1/files?prefix=<前缀>`
+  （带分页游标）。不支持 HEAD。
+
+管理接口（`x-admin-token: <ADMIN_TOKEN>` 鉴权，只群主可用）：
+
+- `POST /v1/admin/tokens` — 给指定 bot_id 签发 Token（明文只返回一次）
+- `DELETE /v1/admin/tokens` — 吊销指定 bot_id 的全部 Token
+
+## Token 怎么存、怎么发
+
+Token 不走环境变量或 KV：签发时 Worker 生成随机 Token，只把它的
+SHA-256 哈希写入 D1 的 `api_tokens` 表（哈希 → bot_id），明文只在
+签发响应里出现一次；鉴权时 Worker 哈希来访 Token 查表认人。签发与
+吊销都走上面的管理接口，`ADMIN_TOKEN` 本身是 Worker 的一个 secret
+（部署时设置，只群主知道）。bot_id 限 `^[A-Za-z0-9_-]{1,64}$`，
+签发时校验。
 
 ## 同步流程
 
@@ -92,16 +104,23 @@ CREATE TABLE api_tokens (               -- Token 只存 SHA-256 哈希
    有变化才更新本地名册缓存。
 3. 可选混合模式：写库后在群里发一句「定义已更新 v3」当唤醒信号，
    数据库仍是事实来源——群消息丢了也不怕，下次轮询自动补齐。
-4. 群主触发「状态对齐」时，不再逐个发群消息，直接各自查库汇报。
+4. 群主触发「状态对齐」时，云端已接入的 Bot 以查库为准（各自拉
+   最新定义汇报），不再逐个往群里发整份定义；未接入云端的 Bot
+   才走群内广播对齐。定义变化本身始终推送云端库（并按本地协议在
+   群里发通知）。这与 worker 提示词里的口径一致。
 
 ## 部署步骤（群主操作）
 
-1. 注册/登录 Cloudflare（免费），创建 D1 数据库并执行上面的建表 SQL。
-2. 创建 R2 bucket（如 `bot-shared`）。
-3. 部署 Worker（绑定 D1、R2；代码见套件后续版本），设置每个 Bot 的
-   Token（Worker 环境变量或 KV 存 Token 哈希 → bot_id 映射）。
-4. 把 API 地址和各自 Token 分发给每个 Bot 的机主（Token 走安全渠道，
-   不进群、不进仓库），各 Bot 在本地配置里填好即可。
+完整可照抄的命令与控制台点选路径见 `cloudflare/README.md`，概要：
+
+1. 注册/登录 Cloudflare（免费），创建 D1 数据库并执行
+   `cloudflare/schema.sql`。
+2. 创建 R2 bucket（`bot-shared-files`）。
+3. 部署 Worker（代码 `cloudflare/worker.js`），绑定变量名必须恰为
+   `DB`（D1）与 `BUCKET`（R2），并设置 secret `ADMIN_TOKEN`。
+4. 用管理接口给每个 Bot 签发 Token，把 API 地址和各自 Token 通过
+   安全渠道分发给每个 Bot 的机主（Token 不进群、不进仓库），各 Bot
+   在本地配置里填好即可。
 
 ## 与本地文件版的关系
 

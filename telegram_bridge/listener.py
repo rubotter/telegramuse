@@ -18,7 +18,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from telegram_bridge.common import (  # noqa: E402
-    ALLOWLIST_PATH, INBOX_PATH, STATE_DIR, THINKING_PATH,
+    ALLOWLIST_PATH, INBOX_PATH, KNOWN_CHATS_PATH, STATE_DIR, THINKING_PATH,
     api_call, load_json, save_json, token_fingerprint,
 )
 
@@ -26,6 +26,40 @@ OFFSET_PATH = STATE_DIR / "offset.json"
 BOT_PATH = STATE_DIR / "bot.json"
 HEARTBEAT_PATH = STATE_DIR / "heartbeat.json"
 STREAK_PATH = STATE_DIR / "bot-streak.json"
+
+# Non-text message kinds, in detection order. The queue only carries
+# text, so without a type marker a photo/sticker/voice message is
+# indistinguishable from an empty text message downstream.
+_MSG_TYPE_KEYS = (
+    "photo", "sticker", "voice", "video", "video_note", "audio",
+    "document", "animation", "location", "contact", "poll",
+)
+
+
+def msg_type(msg):
+    if msg.get("text"):
+        return "text"
+    for key in _MSG_TYPE_KEYS:
+        if msg.get(key) is not None:
+            return key
+    return "other"
+
+
+def note_known_chats(chat_ids):
+    """Remember every chat the listener has received a message from.
+
+    send_reply.py refuses to send to chats outside this set (unless
+    --force): the bridge should only ever talk where it has been
+    talked to, which blunts prompt-injection attempts to make the
+    worker message arbitrary chats.
+    """
+    known = load_json(KNOWN_CHATS_PATH, [])
+    if not isinstance(known, list):
+        known = []
+    current = set(known)
+    new = {c for c in chat_ids if c is not None} - current
+    if new:
+        save_json(KNOWN_CHATS_PATH, sorted(current | new))
 
 
 def last_queued_update_id():
@@ -241,7 +275,7 @@ def maybe_rotate_inbox(inbox_lines):
                     continue
     except Exception:
         return inbox_lines
-    tmp = str(INBOX_PATH) + ".tmp"
+    tmp = f"{INBOX_PATH}.tmp.{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as f:
         f.writelines(kept)
     os.replace(tmp, INBOX_PATH)
@@ -335,6 +369,7 @@ def main():
                 "from_username": frm.get("username"),
                 "from_is_bot": bool(frm.get("is_bot")),
                 "text": msg.get("text") or "",
+                "msg_type": msg_type(msg),
                 "date": msg.get("date"),
             }, ensure_ascii=False))
         if lines:
@@ -343,12 +378,19 @@ def main():
                 f.flush()
                 os.fsync(f.fileno())
             inbox_lines += len(lines)
+            note_known_chats([chat_id for _, chat_id, _, _ in queued])
             oid = owner_id()
             for from_id, chat_id, chat_type, from_is_bot in queued:
                 if chat_id is not None and not from_is_bot:
                     reset_bot_streak(chat_id)
                 if oid is not None and from_id == oid and chat_id is not None:
-                    start_thinking(chat_id, chat_type)
+                    # Off the polling thread: start_thinking makes two
+                    # synchronous API calls (up to 35s each on a sick
+                    # network) and must not delay the next getUpdates.
+                    threading.Thread(
+                        target=start_thinking, args=(chat_id, chat_type),
+                        daemon=True,
+                    ).start()
         save_json(OFFSET_PATH, {"offset": offset})
 
 

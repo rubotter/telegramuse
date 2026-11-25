@@ -14,9 +14,12 @@ User=<USER>
 #   TELEGRAM_BOT_TOKEN=<token from @BotFather>
 #   TGBRIDGE_HOME=<KIT_DIR>          (optional; defaults to the kit root)
 EnvironmentFile=<KIT_DIR>/bridge.env
-ExecStart=/usr/bin/env python3 <KIT_DIR>/telegram_bridge/listener.py
+ExecStart=/usr/bin/env python3 "<KIT_DIR>/telegram_bridge/listener.py"
 WorkingDirectory=<KIT_DIR>
-Environment=HOME=/home/<USER>
+# %h is the User='s home as systemd resolves it — do NOT hardcode
+# /home/<USER>: homes also live in /Users, /root, or custom paths, and
+# a wrong HOME makes the listener write state to the wrong place.
+Environment=HOME=%h
 Restart=always
 RestartSec=5
 TimeoutStopSec=15

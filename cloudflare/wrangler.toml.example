@@ -1,6 +1,7 @@
 # Copy to wrangler.toml and fill in your own IDs.
-# Deploy:  npx wrangler deploy
-# Secrets: npx wrangler secret put ADMIN_TOKEN   (choose a long random value)
+# Order matters:  1) npx wrangler deploy
+#                 2) npx wrangler secret put ADMIN_TOKEN   (long random value;
+#                    secret put fails before the first deploy)
 
 name = "bot-shared-state"
 main = "worker.js"

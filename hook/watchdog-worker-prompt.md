@@ -11,6 +11,6 @@ Telegram 桥的监听服务 telegram-bridge-listener 当前不健康：一种是
 
 - 输出 OK：什么都不用做，总结里写「监听服务正常」即可。
 - 输出 REPAIRED：在总结里明确告诉主代理「监听服务曾掉线，已自动修复并恢复 active」，因为这意味着掉线期间 Telegram 消息可能延迟或丢失，需要主代理提醒机主。
-- 输出 FAILED 或脚本报错：在总结里原样报告失败步骤，请主代理转告机主需要人工处理。
+- 输出 FAILED 或脚本报错：在总结里原样报告失败步骤，请主代理转告机主需要人工处理。若 FAILED 写明是「no systemd」，说明这台机器没有 systemd、自愈不适用，需要人工直接拉起 `telegram_bridge/listener.py`（见 README 的非 systemd 运行方式），不要反复重跑脚本。
 
 不要做脚本之外的其他操作，不要给 Telegram 发消息。
