@@ -19,10 +19,11 @@ source "$HATCH_HOOK_RUNTIME"
 # byte offset up to which the inbox has been consumed, kept next to the
 # inbox in state/telegram-bridge-checkpoint.json. Polls read only the
 # bytes appended since the offset (a rotated/replaced inbox — smaller
-# than the offset — restarts from 0). The checkpoint is advanced ONLY
-# after wake succeeds: if the wake fails, the same messages are offered
-# again on the next poll instead of being lost. Dry runs never
-# advance it.
+# than the offset — restarts from 0). The checkpoint is committed
+# BEFORE wake is called: in the Muse hook runtime wake() does not
+# return control to the script (observed live 2026-11-25 — a
+# commit-after-wake version re-offered the same message every 5 s for
+# 11 minutes, producing duplicate replies). Dry runs never advance it.
 #
 # Hook logs record metadata only (ids, chat ids, character counts) —
 # never message text. Chat content belongs in the queue, not in a
@@ -136,8 +137,10 @@ case "$DECISION" in
       # Dry run: report what WOULD happen, never wake, never commit
       # the checkpoint (a dry run must not consume real messages).
       silent "dry run: would wake with new Telegram messages" "$PAYLOAD"
-    elif wake "New Telegram messages arrived in the bridge inbox queue" "$PAYLOAD"; then
-      # Wake delivered: only now commit the checkpoint (ids + offset).
+    else
+      # Commit the checkpoint (ids + offset) BEFORE calling wake:
+      # wake() does not return control to this script, so anything
+      # placed after it never runs (see header note, 2026-11-25).
       python3 - "$CHECKPOINT" "$OUT_FILE" <<'PYEOF'
 import json, os, sys
 checkpoint_path, out_path = sys.argv[1], sys.argv[2]
@@ -148,10 +151,7 @@ with open(tmp, "w", encoding="utf-8") as f:
                "inbox_offset": int(result.get("new_offset", 0))}, f)
 os.replace(tmp, checkpoint_path)
 PYEOF
-    else
-      log "wake_failed_checkpoint_kept" "$META"
-      echo "wake failed; checkpoint NOT advanced, messages will be re-offered" >&2
-      exit 1
+      wake "New Telegram messages arrived in the bridge inbox queue" "$PAYLOAD"
     fi
     ;;
   *)
