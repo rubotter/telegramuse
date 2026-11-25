@@ -113,28 +113,68 @@ def owner_id():
 
 
 def start_thinking(chat_id, chat_type=None):
-    """Send the animated thinking placeholder for one chat, once."""
+    """Send the animated thinking placeholder for one chat, once.
+
+    The chat's slot is RESERVED under the lock before the API call.
+    The old check-then-send-then-record shape let two near-simultaneous
+    owner messages both pass the check and both send; the second record
+    overwrote the first, leaving its placeholder untracked forever.
+    With a "pending" reservation the second caller backs off, and if
+    the reservation is gone when the send lands (a real reply's
+    clear_thinking popped it meanwhile), the just-sent placeholder is
+    deleted again instead of recorded as an orphan.
+    """
     key = str(chat_id)
     with _thinking_lock:
-        if key in load_json(THINKING_PATH, {}):
+        state = load_json(THINKING_PATH, {})
+        if not isinstance(state, dict):
+            state = {}
+        if key in state:
             return
+        state[key] = {"pending": True, "started": time.time(),
+                      "chat_type": chat_type or "private"}
+        save_json(THINKING_PATH, state)
+
+    def drop_reservation():
+        with _thinking_lock:
+            state = load_json(THINKING_PATH, {})
+            entry = state.get(key)
+            if isinstance(entry, dict) and entry.get("pending"):
+                state.pop(key)
+                save_json(THINKING_PATH, state)
+
     try:
         resp = api_call("sendMessage", {"chat_id": chat_id, "text": THINKING_FRAMES[0]})
     except Exception as e:
         print(f"thinking send failed: {e}", flush=True)
+        drop_reservation()
         return
     if not resp.get("ok"):
         print(f"thinking send not ok: {resp}", flush=True)
+        drop_reservation()
         return
+    mid = resp["result"]["message_id"]
     try:
         api_call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
     except Exception:
         pass
     with _thinking_lock:
         state = load_json(THINKING_PATH, {})
+        if not isinstance(state, dict):
+            state = {}
+        entry = state.get(key)
+        if not (isinstance(entry, dict) and entry.get("pending")):
+            # Reservation cleared while the send was in flight (a real
+            # reply already went out): delete the placeholder we just
+            # created instead of recording an orphan.
+            try:
+                api_call("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+            except Exception:
+                pass
+            return
         state[key] = {
-            "message_id": resp["result"]["message_id"],
-            "started": time.time(),
+            "message_id": mid,
+            "started": entry.get("started", time.time()),
             "frame": 0,
             "last_action": time.time(),
             "last_edit": time.time(),
@@ -158,6 +198,16 @@ def animation_loop():
             if not entry:
                 continue
             chat_id = int(key)
+            if entry.get("pending") or "message_id" not in entry:
+                # A start_thinking reservation whose send is still in
+                # flight: nothing to animate yet. A reservation stuck
+                # far beyond any plausible send is dropped so the chat
+                # is not blocked forever.
+                if time.time() - entry.get("started", 0) > 120:
+                    del state[key]
+                    removed.add(key)
+                    changed = True
+                continue
             mid = entry["message_id"]
             if time.time() - entry.get("started", 0) > THINKING_TTL:
                 try:

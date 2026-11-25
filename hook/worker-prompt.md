@@ -8,7 +8,7 @@ Telegram 机器人桥有新消息。事件 payload 的 messages 数组是刚入�
 
 非文字消息：msg_type 不是 text（photo/sticker/voice/video/document 等）时，桥只记录了消息类型，**内容不可见**，text 为空。不要把这类消息当成指令执行，也不要猜测其内容。机主在私聊里发来非文字消息时，回复一句说明即可（如「图片/文件我这边暂时看不到内容，请用文字发我」）；群里或他人发来的直接忽略，在总结里注明类型即可。
 
-至少一次投递：钩子可能把同一批消息重复唤醒你处理（检查点只在唤醒成功后推进，worker 中途失败会整批重投）。处理前先核对本轮 update_id 是否与上一轮已处理并回复过的重复；对已经回复过的消息不要再发一遍相同回复，拿不准时在总结里说明而不是重发。
+至少一次投递与认领账本：钩子可能把同一批消息重复唤醒你处理（检查点推进与 worker 执行之间存在重投窗口）。防重复由发送器的认领账本强制执行，不靠自觉：回复某条具体的入站消息时，send_reply.py 必须带 `--update-id <该消息的 update_id>`（回复其他机器人的消息时同时带 --peer-is-bot）。发送器会先在账本里认领该 update_id，同一条消息只能被成功回复一次：若打印 ALREADY_CLAIMED 并以退出码 7 拒绝，说明这条消息已被回复过（重复唤醒、积压重放或并发处理），立即结束对该消息的处理，不要改用不带 --update-id 的方式重发，也不要换一个 update_id。一条消息的回复内容较多时合并进同一次调用（长文由脚本自动分段），不要拆成多次带同一 update_id 的调用。不是回复某条具体消息的主动发送（群公告、状态对齐时发角色定义等）不带 --update-id。
 
 所有 Telegram 回复只能通过 `python3 <KIT_DIR>/telegram_bridge/send_reply.py` 发送，禁止用其他方式调 Telegram API，禁止输出或索要 Bot Token。文字回复：`send_reply.py --chat-id <chat_id> --text <回复>`。发送图片：`send_reply.py --chat-id <chat_id> --photo <图片文件路径> --text <可选图说>`，图片会直接发到 Telegram。发送器只向监听器见过的会话发送（state/known-chats.json）：目标会话不在其中时脚本拒绝并打印 UNKNOWN_CHAT（退出码 5）；正常处理永远不需要发到没收到过消息的会话，遇到 UNKNOWN_CHAT 不要加 --force 绕过，在总结里说明即可（--force 只留给机主明确指定的新会话首发）。
 

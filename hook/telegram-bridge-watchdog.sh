@@ -26,10 +26,13 @@ source "$HATCH_HOOK_RUNTIME"
 # revoked token), an unconditional wake every poll would loop forever.
 # So wakes share ONE global cooldown (not per-reason: a fault flapping
 # between "inactive" and "heartbeat_stale" must not earn a fresh wake
-# each time it changes shape). The cooldown is recorded only AFTER a
-# wake actually succeeds — a failed wake does not consume it — and it
-# clears only after TWO consecutive healthy polls, so a single lucky
-# poll during a flap does not reset the damping.
+# each time it changes shape). The cooldown timestamp is written
+# BEFORE calling wake: in the Muse hook runtime wake() does not
+# return control to the script (observed live 2026-11-25 — post-wake
+# code never ran, which caused an 11-minute duplicate-wake loop in
+# the bridge hook), so anything placed after wake() is dead code. The
+# cooldown clears only after TWO consecutive healthy polls, so a
+# single lucky poll during a flap does not reset the damping.
 
 KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -z "${TGBRIDGE_HOME:-}" && -f "$KIT_DIR/bridge.env" ]]; then
@@ -93,16 +96,11 @@ wake_unless_cooling() {
     silent "watchdog already woke recently; cooling down" '{}'
     return 0
   fi
-  if wake "telegram-bridge-listener unhealthy: $reason" "$payload"; then
-    # Cooldown starts only once the wake is actually delivered.
-    write_wake_state "$now" 0
-  else
-    # A failed wake must not consume the cooldown: the fault is still
-    # unreported, so the next poll should try to wake again.
-    log "watchdog_wake_failed" "{\"reason\":\"$reason\"}"
-    echo "watchdog wake failed for $reason; will retry next poll" >&2
-    exit 1
-  fi
+  # Record the cooldown BEFORE wake (see header: wake() never
+  # returns, so a post-wake write would never happen and the
+  # watchdog would re-wake every poll for the whole outage).
+  write_wake_state "$now" 0
+  wake "telegram-bridge-listener unhealthy: $reason" "$payload"
 }
 
 note_healthy() {
