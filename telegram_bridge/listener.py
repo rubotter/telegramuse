@@ -32,6 +32,7 @@ THINKING_FRAMES = [
     "🌕 思考中…", "🌖 思考中…", "🌗 思考中…", "🌘 思考中…",
 ]
 THINKING_INTERVAL = 1.0   # seconds per frame (deadline-paced, see loop)
+GROUP_THINKING_INTERVAL = 4.0  # groups: ~20 bot actions/min limit, stay well under
 TYPING_REFRESH = 4.0      # sendChatAction typing lasts ~5s server-side
 THINKING_TTL = 600.0      # placeholder auto-deleted after 10 minutes
 _thinking_lock = threading.Lock()
@@ -41,7 +42,7 @@ def owner_id():
     return load_json(ALLOWLIST_PATH, {}).get("owner_id")
 
 
-def start_thinking(chat_id):
+def start_thinking(chat_id, chat_type=None):
     """Send the animated thinking placeholder for one chat, once."""
     key = str(chat_id)
     with _thinking_lock:
@@ -66,6 +67,8 @@ def start_thinking(chat_id):
             "started": time.time(),
             "frame": 0,
             "last_action": time.time(),
+            "last_edit": time.time(),
+            "chat_type": chat_type or "private",
         }
         save_json(THINKING_PATH, state)
 
@@ -95,13 +98,22 @@ def animation_loop():
                 removed.add(key)
                 changed = True
                 continue
-            if time.time() - entry.get("last_action", 0) >= TYPING_REFRESH:
+            # Group chats have a much lower bot rate limit (~20 actions
+            # /min per group): a 1s edit cadence there triggers HTTP 429.
+            # Groups therefore animate at GROUP_THINKING_INTERVAL and
+            # refresh typing less often; private chats keep 1s cadence.
+            is_group = entry.get("chat_type") in ("group", "supergroup")
+            typing_refresh = 8.0 if is_group else TYPING_REFRESH
+            edit_interval = GROUP_THINKING_INTERVAL if is_group else THINKING_INTERVAL
+            if time.time() - entry.get("last_action", 0) >= typing_refresh:
                 try:
                     api_call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
                 except Exception:
                     pass
                 entry["last_action"] = time.time()
                 changed = True
+            if time.time() - entry.get("last_edit", 0) < edit_interval:
+                continue
             frame = (entry.get("frame", 0) + 1) % len(THINKING_FRAMES)
             try:
                 resp = api_call(
@@ -123,6 +135,7 @@ def animation_loop():
                 continue
             entry["fails"] = 0
             entry["frame"] = frame
+            entry["last_edit"] = time.time()
             changed = True
         if changed:
             with _thinking_lock:
@@ -198,7 +211,7 @@ def main():
             if frm.get("id") == bot_id:
                 continue  # never queue our own messages
             chat = msg.get("chat") or {}
-            queued.append((frm.get("id"), chat.get("id")))
+            queued.append((frm.get("id"), chat.get("id"), chat.get("type")))
             lines.append(json.dumps({
                 "update_id": u["update_id"],
                 "chat_id": chat.get("id"),
@@ -216,9 +229,9 @@ def main():
                 os.fsync(f.fileno())
             oid = owner_id()
             if oid is not None:
-                for from_id, chat_id in queued:
+                for from_id, chat_id, chat_type in queued:
                     if from_id == oid and chat_id is not None:
-                        start_thinking(chat_id)
+                        start_thinking(chat_id, chat_type)
         save_json(OFFSET_PATH, {"offset": offset})
 
 

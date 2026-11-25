@@ -28,15 +28,17 @@ send_reply.py ◄─────────────── Agent worker（�
 | 发送器 | `telegram_bridge/send_reply.py` | 唯一对外发送通道：文字、图片、删占位、机器人对聊限流 |
 | 公共层 | `telegram_bridge/common.py` | Bot API 调用（JSON / multipart）、路径与配置 |
 | 唤醒钩子 | `hook/telegram-bridge.sh` + `hook/worker-prompt.md` | 5 秒轮询队列，有新消息才唤醒 Agent，并附处理规则 |
+| 自愈看门狗 | `hook/telegram-bridge-watchdog.sh` + `hook/watchdog-worker-prompt.md` + `telegram_bridge/ensure_listener.sh` | 5 秒轮询监听服务状态，掉线才唤醒 Agent 跑自愈脚本重装单元并拉起服务 |
 
 ## 特性
 
 - **秒级唤醒**：监听器长轮询 + 5 秒钩子轮询本地队列，不依赖任何平台 Webhook。
-- **「思考中」动画**：机主消息一入队就发出占位——Telegram 原生「正在输入…」状态（每 4 秒刷新）+ 消息里月相轮换 🌑🌒🌓🌔🌕🌖🌗🌘（1 秒一帧，按截止时间定速）；正式回复发出前自动删除；不回复的轮次有 `--delete-thinking` 清理；10 分钟 TTL 兜底。
+- **「思考中」动画**：机主消息一入队就发出占位——Telegram 原生「正在输入…」状态（每 4 秒刷新）+ 消息里月相轮换 🌑🌒🌓🌔🌕🌖🌗🌘（1 秒一帧，按截止时间定速）；正式回复发出前自动删除；不回复的轮次有 `--delete-thinking` 清理；10 分钟 TTL 兜底。**群聊自动降速**（4 秒一帧、typing 8 秒刷新）：群里 Bot 限流约 20 次动作/分钟，1 秒一帧会触发 HTTP 429 并连累正式回复（实测踩过）。
 - **图片直达**：`send_reply.py --photo` 用 multipart 上传，图片直接发到 Telegram。
 - **机器人防死循环**：对机器人会话滚动 60 秒最多 60 条，超限脚本直接拒绝（退出码 3 + `RATE_LIMITED`）。
 - **配对白名单**：初始配对模式不回复任何人，机主确认后才锁定 owner ID；之后只处理机主消息，其他真人不回（与机主事务有关的转达机主），其他机器人仅任务相关才回。
 - **重启不丢消息**：getUpdates offset 持久化；状态文件全部原子写（tmp + replace）。
+- **掉线自愈**：虚拟机/容器替换会抹掉 systemd 单元文件、监听服务随之静默死亡（实测一晚多次）。看门狗钩子每 5 秒查一次服务状态，掉线才唤醒 Agent 运行 `ensure_listener.sh`：重装单元 → daemon-reload → enable --now → 验证 active，全程约 10 秒，并向机主汇报。
 
 ## 快速开始
 
@@ -54,7 +56,11 @@ chmod 600 bridge.env        # 把 TELEGRAM_BOT_TOKEN 填进去
 #    b) 其他运行时：任何「每 5 秒 diff inbox.jsonl 与检查点、有新行就唤醒
 #       Agent 并把 worker-prompt.md 作为指令」的机制都可以。
 
-# 4. 配对：用你的 Telegram 给 Bot 发一句话，Agent 会把你的 ID 报给机主
+# 4. 注册自愈看门狗（强烈建议）：用 hook/telegram-bridge-watchdog.sh
+#    再注册一个 5 秒钩子，worker 指令用 hook/watchdog-worker-prompt.md。
+#    监听服务被环境替换弄掉线时，它会自动修复并汇报。
+
+# 5. 配对：用你的 Telegram 给 Bot 发一句话，Agent 会把你的 ID 报给机主
 #    确认，确认后写入 allowlist.json，桥发确认消息，即完成。
 ```
 
